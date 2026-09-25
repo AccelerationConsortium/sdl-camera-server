@@ -1,0 +1,11 @@
+{
+  "auto_discover": false,
+  "tokens": [{"token": "REPLACE-WITH-A-RANDOM-SECRET-AT-LEAST-24-CHARACTERS", "cameras": ["*"], "admin": true}],
+  "captures": {"enabled": true, "root": "./captures", "keep_days": 30, "keep_max_gb": 10},
+  "cameras": [
+    {"id": "overhead", "kind": "usb", "match": {"identity": "COPY-FROM-DISCOVERY"}},
+    {"id": "depth_camera", "kind": "realsense", "serial": "COPY-FROM-DISCOVERY", "idle_timeout_seconds": 30,
+     "color": {"enabled": true, "width": 640, "height": 480, "fps": 30},
+     "depth": {"enabled": true, "width": 640, "height": 480, "fps": 30}}
+  ]
+}
