@@ -9,3 +9,5 @@ dist/
 !.env.example
 *.lockfile
 captures/
+local/
+*.local.py

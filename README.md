@@ -23,9 +23,13 @@ worker; the next explicit request can try again. No robot SDK is required.
 
 ## Python
 
-A Python consumer needs only `pip install sdl-camera-server` (or installation
-from this Git repository until a PyPI release is published). Driver extras are
-needed by the service, not by HTTP clients.
+Install the Python client from this repository (there is no PyPI release yet):
+
+```sh
+pip install "sdl-camera-server @ git+https://github.com/AccelerationConsortium/sdl-camera-server.git"
+```
+
+Driver extras are needed by the service, not by HTTP clients.
 
 ```python
 import os
@@ -65,7 +69,7 @@ identity and robot claim rules; service credentials are not end-user credentials
 - `DELETE .../captures/{capture_id}`: administrator deletion.
 
 Frames and archives are data, not repository content. Keep capture roots outside
-checkouts. Existing RealSense capture IDs and directory formats are supported.
+checkouts, or in the git-ignored `local/` directory for a self-contained installation. Existing RealSense capture IDs and directory formats are supported.
 Context supplied by a robot is explicitly separate from camera timestamps; it is
 not a hardware synchronization guarantee. Do not auto-retry capture writes.
 
