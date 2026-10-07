@@ -17,7 +17,10 @@ def _run(pipe, spec):
         kind = spec['kind']
         if kind == 'realsense':
             from .realsense_camera import RealSenseCamera
-            camera = RealSenseCamera(dict(spec, enabled=True), camera_id=spec['id'])
+            settings = dict(spec, enabled=True)
+            if spec.get('always_on'):
+                settings['idle_timeout_seconds'] = 0
+            camera = RealSenseCamera(settings, camera_id=spec['id'])
         else:
             from .usb_camera import CameraManager
             manager = CameraManager()
@@ -26,6 +29,10 @@ def _run(pipe, spec):
             if len(matches) != 1:
                 raise CameraError(f'USB selector matched {len(matches)} cameras; expected exactly one')
             camera = manager.get(matches[0]['id'])
+            camera.idle_timeout = (0 if spec.get('always_on') else
+                                   spec.get('idle_timeout_seconds', camera.idle_timeout))
+            camera.resolution = (int(spec.get('width', 1280)), int(spec.get('height', 720)))
+        jpeg_cache = {}
         while True:
             operation, args = pipe.recv()
             try:
@@ -39,9 +46,16 @@ def _run(pipe, spec):
                                   label=spec.get('label', spec['id']))
                 elif operation == 'stop':
                     camera.stop()
+                    jpeg_cache.clear()
                     result = camera.describe()
                 elif operation == 'start':
-                    camera.start(**args) if kind == 'realsense' else camera.start()
+                    if kind == 'realsense':
+                        camera.start(**args)
+                    else:
+                        # A USB index can change after unplug/replug. Verify the
+                        # configured identity again before opening a device.
+                        camera = manager.get(camera.device['id'])
+                        camera.start()
                     result = camera.describe()
                 elif operation == 'diagnostic':
                     if kind != 'realsense':
@@ -67,7 +81,13 @@ def _run(pipe, spec):
                                         depth_scale_m=bundle.depth_scale, intrinsics=bundle.intrinsics,
                                         aligned_depth_to_color=camera.align_depth_to_color)
                         if operation == 'snapshot':
-                            result = (camera.encode_jpeg(bundle, args.get('stream', 'color')), metadata)
+                            stream = args.get('stream', 'color')
+                            key = (stream, bundle.frame_number, bundle.captured_at)
+                            if key not in jpeg_cache:
+                                if len(jpeg_cache) >= 2:
+                                    jpeg_cache.pop(next(iter(jpeg_cache)))
+                                jpeg_cache[key] = camera.encode_jpeg(bundle, stream)
+                            result = (jpeg_cache[key], metadata)
                         elif operation == 'depth_png':
                             result = (camera.encode_depth_png(bundle), metadata)
                         else:

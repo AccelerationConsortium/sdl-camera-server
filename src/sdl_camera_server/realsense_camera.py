@@ -143,8 +143,8 @@ class RealSenseCamera:
         # "auto exposure priority" otherwise stretches exposure and halves
         # fps (a D435i measured 14 fps against 30 configured, 2026-09-23).
         self.keep_frame_rate = bool(config.get("keep_frame_rate", True))
-        self.color_profile = _stream_profile(config.get("color"), 640, 480, 30)
-        self.depth_profile = _stream_profile(config.get("depth"), 640, 480, 30)
+        self.color_profile = _stream_profile(config.get("color"), 1280, 720, 30)
+        self.depth_profile = _stream_profile(config.get("depth"), 1280, 720, 30)
 
         # Backend. Import lazily so the module (and the whole API server)
         # stays importable on a machine without the extra installed.

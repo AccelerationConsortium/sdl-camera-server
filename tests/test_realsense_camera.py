@@ -396,7 +396,8 @@ class TestConfiguration:
         cam = built["rs435i"]
         assert cam.configured and cam.serial == "ABC" and cam.camera_id == "rs435i"
         assert cam.color_profile == {"enabled": True, "width": 320, "height": 240, "fps": 15}
-        assert cam.depth_profile["width"] == 640  # default kept
+        assert cam.depth_profile["width"] == 1280  # default kept
+        assert cam.depth_profile["height"] == 720
 
     def test_synthetic_yaml_parses(self, rs):
         pytest.importorskip("yaml")
@@ -452,7 +453,8 @@ class TestConfiguration:
                                       color={"width": "bad"}),
                               camera_id="rs435i", rs_module=rs, np_module=np)
         assert cam.jpeg_quality == 80 and cam.frame_timeout_ms == 5000
-        assert cam.color_profile["width"] == 640
+        assert cam.color_profile["width"] == 1280
+        assert cam.color_profile["height"] == 720
 
 
 class TestEnumeration:

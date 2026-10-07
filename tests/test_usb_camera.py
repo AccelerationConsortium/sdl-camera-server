@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 
 from sdl_camera_server.usb_camera import CameraManager, CameraUnavailable, OpenCVBackend
 
@@ -79,6 +80,38 @@ def test_multiple_viewers_share_one_owner(rig):
     cam.stop()
     assert backend.cap.released
     with pytest.raises(CameraUnavailable):
+        cam.jpeg()
+
+
+@pytest.mark.parametrize('resolution', [(1280, 720), (1920, 1080), (3840, 2160)])
+def test_requested_resolution_is_checked_on_actual_frames(rig, resolution):
+    manager, backend = rig
+    width, height = resolution
+    requested = []
+    backend.configure_resolution = lambda cap, w, h: requested.append((w, h))
+    def read_frame():
+        time.sleep(0.005)
+        return True, np.zeros((height, width, 3), dtype=np.uint8)
+    backend.cap.read = read_frame
+    cam = manager.get('usb-test')
+    cam.resolution = resolution
+    cam.start()
+    assert cam.jpeg()[0] == b'jpeg'
+    assert requested == [resolution]
+    assert cam.describe()['requested_resolution'] == list(resolution)
+
+
+def test_requested_resolution_rejects_driver_fallback(rig):
+    manager, backend = rig
+    backend.configure_resolution = lambda cap, w, h: None
+    def read_frame():
+        time.sleep(0.005)
+        return True, np.zeros((480, 640, 3), dtype=np.uint8)
+    backend.cap.read = read_frame
+    cam = manager.get('usb-test')
+    cam.resolution = (1280, 720)
+    cam.start()
+    with pytest.raises(CameraUnavailable, match='does not provide 1280x720'):
         cam.jpeg()
 
 

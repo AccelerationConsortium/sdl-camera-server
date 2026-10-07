@@ -56,6 +56,10 @@ class OpenCVBackend:
     def open(self, device):
         return self.cv2.VideoCapture(device['index'], device['backend'])
 
+    def configure_resolution(self, capture, width, height):
+        capture.set(self.cv2.CAP_PROP_FRAME_WIDTH, width)
+        capture.set(self.cv2.CAP_PROP_FRAME_HEIGHT, height)
+
     def encode(self, frame):
         ok, data = self.cv2.imencode('.jpg', frame, [self.cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
@@ -76,6 +80,7 @@ class USBCamera:
         self._frame_at = 0.0
         self._reason = None
         self.idle_timeout = idle_timeout
+        self.resolution = None
         self._last_consumer_at = time.monotonic()
 
     def describe(self):
@@ -90,6 +95,7 @@ class USBCamera:
                               else 'streaming' if running and self._jpeg
                               else 'starting' if running else 'off'),
                     "reason": self._reason, "capabilities": ["color", "snapshot", "mjpeg"],
+                    "requested_resolution": list(self.resolution) if self.resolution else None,
                     "frame_number": self._frame_number,
                     "frame_age_s": time.monotonic() - self._frame_at if self._jpeg else None}
 
@@ -115,12 +121,19 @@ class USBCamera:
             cap = self.backend.open(dict(self.device))
             if not cap.isOpened():
                 raise CameraUnavailable('Cannot open camera (disconnected or in use)')
+            if self.resolution:
+                self.backend.configure_resolution(cap, *self.resolution)
             while not self._stop.is_set():
                 if self.idle_timeout and time.monotonic() - self._last_consumer_at > self.idle_timeout:
                     break
                 ok, frame = cap.read()
                 if not ok:
                     raise CameraUnavailable('Camera stopped delivering frames')
+                shape = getattr(frame, 'shape', ())
+                if self.resolution and (len(shape) < 2 or
+                                        (shape[1], shape[0]) != self.resolution):
+                    raise CameraUnavailable(
+                        f'Camera does not provide {self.resolution[0]}x{self.resolution[1]} frames')
                 jpeg = self.backend.encode(frame)
                 with self._condition:
                     self._jpeg = jpeg

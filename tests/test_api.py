@@ -23,6 +23,9 @@ class Service:
         if cid not in self.workers:raise CameraError('Unknown camera',404)
         return self.workers[cid]
     def close(self):pass
+    def start_always_on(self):pass
+    def start_camera(self,cid):return self.get(cid).call('start')
+    def stop_camera(self,cid):return self.get(cid).call('stop')
 
 @pytest.fixture
 def client(tmp_path):
@@ -53,6 +56,30 @@ def test_snapshot_and_capture_archive(client):
     assert client.get('/v1/store').json()['count']==1
     assert client.delete(result['urls']['meta']).status_code==200
     assert client.get(result['urls']['meta']).status_code==404
+
+def test_mjpeg_has_frame_boundaries_and_skips_duplicate_frames(tmp_path):
+    class StreamingWorker(Worker):
+        def __init__(self):self.calls=0
+        def call(self,op,**kwargs):
+            if op=='snapshot':
+                self.calls+=1
+                if self.calls==1:return b'first',{'frame_number':1}
+                if self.calls==2:return b'first',{'frame_number':1}
+                if self.calls==3:return b'second',{'frame_number':2}
+                raise CameraError('Stopped')
+            return super().call(op,**kwargs)
+    service=Service()
+    service.workers={'overhead':StreamingWorker()}
+    config={'tokens':[{'token':TOKEN,'cameras':['overhead'],'admin':True}],
+            '_lock_path':str(tmp_path/'test.lock')}
+    with TestClient(create_app(config,service)) as stream_client:
+        response=stream_client.get('/v1/cameras/overhead/stream.mjpg?fps=30',
+                                   headers={'Authorization':'Bearer '+TOKEN})
+    assert response.status_code==200
+    assert response.content.count(b'--camera-frame\r\n')==2
+    assert b'Content-Length: 5\r\nX-Frame-Number: 1\r\n' in response.content
+    assert b'Content-Length: 6\r\nX-Frame-Number: 2\r\n' in response.content
+    assert service.workers['overhead'].calls==4
 
 def test_duplicate_camera_owner_rejected():
     with pytest.raises(ValueError,match='same camera'):

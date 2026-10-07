@@ -52,6 +52,7 @@ def create_app(config, service=None):
         try:
             if config.get('auto_discover'):
                 await asyncio.to_thread(service.refresh_discovery)
+            await asyncio.to_thread(service.start_always_on)
             yield
         finally:
             await asyncio.to_thread(service.close)
@@ -128,13 +129,15 @@ def create_app(config, service=None):
 
     @app.post('/v1/cameras/{camera_id}/start')
     async def start(camera_id: str, p=Depends(principal)):
-        return await run(worker(camera_id,p).call, 'start')
+        worker(camera_id,p)
+        return await run(service.start_camera, camera_id)
 
     @app.post('/v1/cameras/{camera_id}/stop')
     async def stop(camera_id: str, p=Depends(principal)):
         if not p.get('admin'):
             raise HTTPException(403, detail='admin_required')
-        return await run(worker(camera_id,p).call, 'stop')
+        worker(camera_id,p)
+        return await run(service.stop_camera, camera_id)
 
     @app.get('/v1/cameras/{camera_id}/snapshot.jpg')
     async def snapshot(camera_id: str, stream: str = Query('color', pattern='^(color|depth)$'), p=Depends(principal)):
@@ -169,12 +172,18 @@ def create_app(config, service=None):
         async def body():
             data, meta = first
             while True:
-                yield b'--camera-frame\r\nContent-Type: image/jpeg\r\n\r\n'+data+b'\r\n'
-                await asyncio.sleep(1/fps)
-                try:
-                    data,meta = await asyncio.to_thread(w.call, 'snapshot', stream=stream)
-                except CameraError:
-                    return
+                yield (b'--camera-frame\r\nContent-Type: image/jpeg\r\n'
+                       + f'Content-Length: {len(data)}\r\nX-Frame-Number: {meta["frame_number"]}\r\n\r\n'.encode('ascii')
+                       + data + b'\r\n')
+                while True:
+                    await asyncio.sleep(1/fps)
+                    try:
+                        next_data, next_meta = await asyncio.to_thread(w.call, 'snapshot', stream=stream)
+                    except CameraError:
+                        return
+                    if next_meta['frame_number'] != meta['frame_number']:
+                        data, meta = next_data, next_meta
+                        break
         return StreamingResponse(body(), media_type='multipart/x-mixed-replace; boundary=camera-frame',
                                  headers={'Cache-Control':'no-store'})
 

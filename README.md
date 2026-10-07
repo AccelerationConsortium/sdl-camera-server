@@ -19,7 +19,18 @@ Use a dedicated virtual environment. Omit an extra only on machines that do not
 need that driver. Discovery reports missing backends independently. The CLI runs
 one API process; a configuration lock rejects duplicate service instances.
 Each camera runs in its own spawned worker process. Driver timeouts stop that
-worker; the next explicit request can try again. No robot SDK is required.
+worker; the next explicit request can try again. Cameras configured with
+`"always_on": true` are started when the service starts and retried every five
+seconds if their worker or device fails. They keep capturing with no viewers,
+and every MJPEG viewer reads the same camera owner. An administrator's `/stop`
+pauses automatic restart until `/start` is called or the service restarts.
+Always-on overrides the camera's idle timeout. No robot SDK is required.
+USB webcams default to 1280×720. Set the camera's `width` and `height` to request
+any supported resolution, including higher modes such as 1920×1080 or
+3840×2160. USB cameras reject a driver fallback to another size; select a mode
+the webcam supports. RealSense color/depth streams remain at 1280×720 by default,
+with native profiles configurable through `color` and `depth`. The example uses
+15 fps for both RealSense streams; the code default is 30 fps.
 
 ## Python
 
@@ -47,6 +58,29 @@ The Python `CameraService` class also provides local worker management. Prefer t
 HTTP client when the service is running: another driver instance must not open
 the same camera.
 
+For computer vision, decode a snapshot into an array and pass it to your model:
+
+```python
+import io
+import os
+import numpy as np
+from PIL import Image
+from sdl_camera_server import CameraClient
+
+with CameraClient("http://<camera-host>:<port>", os.environ["CAMERA_API_TOKEN"]) as camera:
+    rgb = np.asarray(Image.open(io.BytesIO(camera.snapshot("<camera-id>"))).convert("RGB"))
+    # predictions = model(rgb)
+    # For a RealSense camera with depth enabled:
+    raw_depth = np.asarray(Image.open(io.BytesIO(camera.depth_png("<camera-id>"))))
+    depth_info = camera.request("GET", "/v1/cameras/<camera-id>/intrinsics").json()
+    depth_metres = raw_depth.astype(np.float32) * depth_info["depth_scale_m"]
+```
+
+The snapshot and depth requests can read different frames. For a matching RGB
+and depth pair, use `POST /v1/cameras/{id}/captures` and fetch its two image
+artifacts. Only use corresponding pixel coordinates when `aligned_to` from
+`/intrinsics` is `color`.
+
 ## API
 
 `/health` and OpenAPI documentation are public. Every `/v1/*` route requires
@@ -67,6 +101,20 @@ identity and robot claim rules; service credentials are not end-user credentials
 - `GET .../captures`, `.../captures/{capture_id}`: capture metadata.
 - `GET .../captures/{capture_id}/{filename}`: image artifact.
 - `DELETE .../captures/{capture_id}`: administrator deletion.
+
+For an RGB preview, give each viewer a credential scoped to that camera and
+connect to `/v1/cameras/{id}/stream.mjpg?stream=color&fps=10` with a Bearer
+authorization header. Multiple viewers can connect simultaneously; the server
+captures once per camera and sends each viewer new frames at up to its requested
+rate. A plain browser `<img>` cannot attach the Bearer header, so a browser UI needs an
+authenticated gateway or a client that fetches with that header. Reconnect the
+viewer if a camera outage ends its MJPEG response.
+
+For a webcam-style preview, `always_on` on the RGB camera avoids startup delay
+for each viewer. On a RealSense camera, `always_on` also runs depth continuously
+when `depth.enabled` is true. Set `depth.enabled` to false if the PC only needs
+RGB; depth endpoints and paired depth captures then have no depth data. Depth
+on demand would require a pipeline mode switch and a short RGB interruption.
 
 Frames and archives are data, not repository content. Keep capture roots outside
 checkouts, or in the git-ignored `local/` directory for a self-contained installation. Existing RealSense capture IDs and directory formats are supported.
