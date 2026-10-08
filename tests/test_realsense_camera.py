@@ -305,6 +305,9 @@ def _config(**overrides):
         "jpeg_quality": 80,
         "frame_timeout_ms": 500,
         "max_consecutive_frame_failures": 3,
+        # Publish from the first frame; TestWarmup covers the warm-up.
+        "warmup_frames": 0,
+        "warmup_seconds": 0,
     }
     cfg.update(overrides)
     return cfg
@@ -327,6 +330,14 @@ def _wait_frames(cam, n=1, timeout=2.0):
     while cam.frames_captured < n and time.monotonic() < deadline:
         time.sleep(0.005)
     assert cam.frames_captured >= n, "capture thread produced no frames"
+
+
+def _wait_fps(cam, timeout=2.0):
+    # The fps estimate needs two frames on distinct clock ticks; Windows'
+    # ~16 ms monotonic tick can hold several 2 ms fake frames.
+    deadline = time.monotonic() + timeout
+    while cam.describe()["fps_measured"] is None and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +604,7 @@ class TestCapture:
     def test_frames_flow_and_fps_is_measured(self, camera):
         camera.start()
         _wait_frames(camera, n=5)
+        _wait_fps(camera)
         d = camera.describe()
         assert d["frames_captured"] >= 5
         assert d["fps_measured"] is not None and d["fps_measured"] > 0
@@ -685,6 +697,68 @@ class TestCapture:
 
     def test_wait_for_new_frame_returns_none_when_stopped(self, camera):
         assert camera.wait_for_new_frame(0, timeout_s=0.1) is None
+
+
+class TestWarmup:
+    def test_defaults_drop_thirty_frames_and_two_seconds(self, rs):
+        cam = RealSenseCamera({"enabled": True}, rs_module=rs, np_module=np)
+        assert (cam.warmup_frames, cam.warmup_seconds) == (30, 2.0)
+
+    def test_bad_or_extreme_values_are_bounded(self, rs):
+        cam = RealSenseCamera(_config(warmup_frames="x", warmup_seconds=None), rs_module=rs, np_module=np)
+        assert (cam.warmup_frames, cam.warmup_seconds) == (30, 2.0)
+        cam = RealSenseCamera(_config(warmup_frames=-5, warmup_seconds=1e9), rs_module=rs, np_module=np)
+        assert (cam.warmup_frames, cam.warmup_seconds) == (0, 10.0)
+
+    def test_first_published_frame_comes_after_the_warmup_frames(self, rs):
+        cam = RealSenseCamera(_config(warmup_frames=8), rs_module=rs, np_module=np)
+        try:
+            cam.start()
+            bundle = cam.latest()
+            # Frame 1 is consumed by the start-up check, 2..9 are dropped.
+            assert bundle.frame_number == 10
+            assert not cam.describe()["warming_up"]
+        finally:
+            cam.stop()
+
+    def test_latest_waits_out_the_warmup_seconds(self, rs):
+        cam = RealSenseCamera(_config(warmup_seconds=0.3), rs_module=rs, np_module=np)
+        try:
+            cam.start()
+            assert cam.describe()["warming_up"] and cam.frames_captured == 0
+            started = time.monotonic()
+            cam.latest()
+            assert time.monotonic() - started >= 0.2
+            assert not cam.describe()["warming_up"]
+        finally:
+            cam.stop()
+
+    def test_a_warmup_longer_than_the_frame_timeout_still_returns_a_frame(self, rs):
+        # frame_timeout_ms is 500 in _config; the wait covers the warm-up too.
+        cam = RealSenseCamera(_config(warmup_seconds=0.8), rs_module=rs, np_module=np)
+        try:
+            cam.start()
+            assert cam.latest().frame_number > 1
+        finally:
+            cam.stop()
+
+    def test_restart_warms_up_again(self, rs):
+        cam = RealSenseCamera(_config(warmup_frames=5), rs_module=rs, np_module=np)
+        try:
+            cam.start()
+            cam.latest()
+            cam.stop()
+            cam.start()
+            assert cam.latest().frame_number == 7  # a fresh pipeline counts from 1
+        finally:
+            cam.stop()
+
+    def test_stop_during_warmup_raises_not_streaming(self, rs):
+        cam = RealSenseCamera(_config(warmup_seconds=5), rs_module=rs, np_module=np)
+        cam.start()
+        threading.Timer(0.1, cam.stop).start()
+        with pytest.raises(RealSenseNotStreaming, match="stopped"):
+            cam.latest()
 
 
 class TestEncoding:
@@ -809,6 +883,7 @@ class TestReporting:
     def test_streaming_component(self, camera):
         camera.start()
         _wait_frames(camera, n=3)
+        _wait_fps(camera)
         block = camera.component_status()
         assert block["connected"] is True and block["state"] == "streaming"
         assert block["message"].startswith("test cam · Intel RealSense D435I · sn 123456")

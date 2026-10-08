@@ -31,6 +31,10 @@ any supported resolution, including higher modes such as 1920×1080 or
 the webcam supports. RealSense color/depth streams remain at 1280×720 by default,
 with native profiles configurable through `color` and `depth`. The example uses
 15 fps for both RealSense streams; the code default is 30 fps.
+After a RealSense pipeline starts, no frame is served until auto exposure and
+white balance have settled: at least `warmup_frames` (default 30) and
+`warmup_seconds` (default 2) have passed. The first snapshot after idle is
+therefore about two seconds slower. Set both to 0 to serve the first frame.
 
 ## Python
 
