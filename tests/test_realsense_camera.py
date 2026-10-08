@@ -332,6 +332,14 @@ def _wait_frames(cam, n=1, timeout=2.0):
     assert cam.frames_captured >= n, "capture thread produced no frames"
 
 
+def _wait_fps(cam, timeout=2.0):
+    # The fps estimate needs two frames on distinct clock ticks; Windows'
+    # ~16 ms monotonic tick can hold several 2 ms fake frames.
+    deadline = time.monotonic() + timeout
+    while cam.describe()["fps_measured"] is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 # ---------------------------------------------------------------------------
 # Configuration / availability
 # ---------------------------------------------------------------------------
@@ -596,6 +604,7 @@ class TestCapture:
     def test_frames_flow_and_fps_is_measured(self, camera):
         camera.start()
         _wait_frames(camera, n=5)
+        _wait_fps(camera)
         d = camera.describe()
         assert d["frames_captured"] >= 5
         assert d["fps_measured"] is not None and d["fps_measured"] > 0
@@ -874,6 +883,7 @@ class TestReporting:
     def test_streaming_component(self, camera):
         camera.start()
         _wait_frames(camera, n=3)
+        _wait_fps(camera)
         block = camera.component_status()
         assert block["connected"] is True and block["state"] == "streaming"
         assert block["message"].startswith("test cam · Intel RealSense D435I · sn 123456")
