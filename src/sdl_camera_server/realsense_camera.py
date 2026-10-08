@@ -143,6 +143,12 @@ class RealSenseCamera:
         # "auto exposure priority" otherwise stretches exposure and halves
         # fps (a D435i measured 14 fps against 30 configured, 2026-09-23).
         self.keep_frame_rate = bool(config.get("keep_frame_rate", True))
+        # Auto exposure and white balance need a moment after a cold start:
+        # a D435i's first snapshot after idle averaged luma 26 against 87
+        # once warm, with a green cast (2026-10-08). Frames are not published
+        # until both minimums have passed; 0 and 0 publish the first frame.
+        self.warmup_frames = int(min(300, max(0, _as_float(config.get("warmup_frames"), 30))))
+        self.warmup_seconds = min(10.0, max(0.0, _as_float(config.get("warmup_seconds"), 2.0)))
         self.color_profile = _stream_profile(config.get("color"), 1280, 720, 30)
         self.depth_profile = _stream_profile(config.get("depth"), 1280, 720, 30)
 
@@ -174,6 +180,7 @@ class RealSenseCamera:
         self._last_consumer_at = time.monotonic()
         self._last_error: Optional[str] = None
         self._started_at: Optional[float] = None
+        self._warming_up = False
         self._diagnostic = None
         self._diagnostic_lock = threading.Lock()
 
@@ -366,6 +373,7 @@ class RealSenseCamera:
                 self._latest = None
                 self._frames_captured = 0
                 self._fps_ema = None
+                self._warming_up = True
                 self._started_at = time.monotonic()
                 self._last_consumer_at = time.monotonic()
                 self._stop_event = threading.Event()
@@ -522,6 +530,8 @@ class RealSenseCamera:
         np = self._np
         failures = 0
         last_t: Optional[float] = None
+        loop_started = time.monotonic()
+        warmup_skipped = 0
         while not self._stop_event.is_set():
             with self._lock:
                 pipeline, align, colorizer = self._pipeline, self._align, self._colorizer
@@ -551,6 +561,17 @@ class RealSenseCamera:
                 if ((self.depth_profile["enabled"] and not depth_frame)
                         or (self.color_profile["enabled"] and not color_frame)):
                     continue  # partial frameset; librealsense delivers the next one shortly
+                with self._lock:
+                    warming_up = self._warming_up
+                if warming_up:
+                    failures = 0
+                    warmup_skipped += 1
+                    if (warmup_skipped <= self.warmup_frames
+                            or time.monotonic() - loop_started < self.warmup_seconds):
+                        continue  # exposure still settling; publish nothing yet
+                    with self._lock:
+                        self._warming_up = False
+                    logger.info("RealSense warm-up done: %d frames skipped", warmup_skipped - 1)
 
                 color = np.asanyarray(color_frame.get_data()).copy() if color_frame else None
                 depth = np.asanyarray(depth_frame.get_data()).copy() if depth_frame else None
@@ -616,11 +637,25 @@ class RealSenseCamera:
             if mark_consumer:
                 self._last_consumer_at = time.monotonic()
             if self._latest is None:
-                # First frame after start: give the capture thread a moment.
-                self._frame_ready.wait(timeout=self.frame_timeout_ms / 1000.0)
+                # First frame after start: give the capture thread a moment,
+                # including the warm-up frames it drops before publishing.
+                deadline = time.monotonic() + self.frame_timeout_ms / 1000.0 + self._warmup_budget_s()
+                while self._latest is None and self._state == "streaming":
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._frame_ready.wait(timeout=remaining)
             if self._latest is None:
+                if self._state != "streaming":
+                    raise RealSenseNotStreaming(self._last_error or "RealSense pipeline is stopped")
                 raise RealSenseNotStreaming("no frame received yet")
             return self._latest
+
+    def _warmup_budget_s(self) -> float:
+        """Longest the warm-up should take at the configured frame rate."""
+        profile = self.color_profile if self.color_profile["enabled"] else self.depth_profile
+        fps = max(1.0, _as_float(profile.get("fps"), 30))
+        return max(self.warmup_seconds, self.warmup_frames / fps)
 
     def wait_for_new_frame(self, after: int, timeout_s: float) -> Optional[FrameBundle]:
         """Block until a frame newer than ``after`` (a frames_captured count) lands."""
@@ -791,6 +826,7 @@ class RealSenseCamera:
                 },
                 "depth_scale_m": self._depth_scale,
                 "frames_captured": self._frames_captured,
+                "warming_up": state == "streaming" and self._warming_up,
                 "fps_measured": round(self._fps_ema, 1) if self._fps_ema else None,
                 "last_frame_age_s": (round(time.monotonic() - latest.captured_at, 2)
                                      if latest else None),
