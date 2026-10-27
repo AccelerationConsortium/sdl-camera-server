@@ -178,6 +178,21 @@ across a hub. Test all cameras concurrently, including frame freshness, bounded
 stream cancellation, and robot API responsiveness. A camera outage is not a robot
 fault unless the workflow explicitly requires its evidence.
 
+## Known issues
+
+**A RealSense can drop from USB 3 to USB 2 every now and then.** The link is
+renegotiated by the host and the camera, not by this service, and once it has
+fallen back the camera stays on USB 2 until the cable is unplugged and plugged
+back in (a different port or cable if it recurs). Software cannot recover it: a
+service restart or a hardware reset keeps the USB 2 link. The tells are
+`device.usb_type` reading `2.x` in `GET /v1/cameras/{id}/status`, a
+`USB 2.x link` entry in `warnings`, a `start` refused because librealsense
+rejects the 1280x720 depth+color profiles on USB 2, or a lower frame rate than
+configured. A workflow that needs the camera should read `device.usb_type`
+before relying on depth and ask the operator to re-seat the cable when it is
+not `3.x`; the RealSense streams are not available until then. Observed on the
+D435i and D405 of the xArm PC (reported 2026-10-27).
+
 ## Development
 
 ```sh
