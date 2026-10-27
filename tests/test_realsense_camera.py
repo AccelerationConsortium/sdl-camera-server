@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,13 +49,18 @@ class _Enum:
 
 
 class FakeDevice:
-    """rs.device: get_info / supports / first_depth_sensor."""
+    """rs.device: get_info / supports / first_depth_sensor / query_sensors.
 
-    def __init__(self, serial, name="Intel RealSense D435I", usb="3.2", fw="5.16.0.1"):
+    ``imu`` decides whether a Motion Module sensor is offered; by default a
+    D435i has one and any other model does not.
+    """
+
+    def __init__(self, serial, name="Intel RealSense D435I", usb="3.2", fw="5.16.0.1", imu=None):
         self._info = {
             "name": name, "serial_number": serial, "firmware_version": fw,
             "usb_type_descriptor": usb, "product_line": "D400", "product_id": "0B3A",
         }
+        self.imu = ("435I" in name.upper()) if imu is None else bool(imu)
 
     def supports(self, member):
         return member.name in self._info
@@ -63,10 +69,12 @@ class FakeDevice:
         return self._info[member.name]
 
     def first_depth_sensor(self):
-        return self
+        sensors = self.query_sensors()
+        return sensors[0] if sensors else self
 
-    # hardware_reset / query_sensors: the stuck-camera recovery and the
-    # keep-frame-rate option. ``rs_ns`` is attached by FakePipelineProfile.
+    # hardware_reset / query_sensors: the stuck-camera recovery, the
+    # keep-frame-rate option and the calibration read. ``rs_ns`` is attached
+    # by FakePipelineProfile / FakeContext.
     rs_ns = None
 
     def hardware_reset(self):
@@ -75,23 +83,153 @@ class FakeDevice:
             self.rs_ns.stuck = self.rs_ns.stuck_after_reset
 
     def query_sensors(self):
-        return [FakeSensor(self.rs_ns)] if self.rs_ns is not None else []
+        if self.rs_ns is None:
+            return []
+        if self.rs_ns.sensor_query_error:
+            raise RuntimeError(self.rs_ns.sensor_query_error)
+        rs = self.rs_ns
+
+        def video(stream, index, fmt, sizes, fps_list):
+            return [FakeStreamProfile(rs, stream, index, fmt, fps, w, h)
+                    for (w, h) in sizes for fps in fps_list]
+
+        stereo_sizes = [(1280, 720), (848, 480)]
+        stereo = FakeSensor(rs, "Stereo Module",
+                            video("depth", 0, "z16", stereo_sizes, [30, 15])
+                            + video("infrared", 1, "y8", stereo_sizes, [30, 15])
+                            + video("infrared", 2, "y8", stereo_sizes, [30, 15]))
+        rgb = FakeSensor(rs, "RGB Camera",
+                         video("color", 0, "bgr8", [(1280, 720)], [30, 15])
+                         + video("color", 0, "rgb8", [(1280, 720)], [30, 15])
+                         + video("color", 0, "bgr8", [(640, 480)], [30]))
+        sensors = [stereo, rgb]
+        if self.imu:
+            sensors.append(FakeSensor(rs, "Motion Module", [
+                FakeStreamProfile(rs, "accel", 0, "motion_xyz32f", 63, motion=True),
+                FakeStreamProfile(rs, "accel", 0, "motion_xyz32f", 250, motion=True),
+                FakeStreamProfile(rs, "gyro", 0, "motion_xyz32f", 200, motion=True),
+                FakeStreamProfile(rs, "gyro", 0, "motion_xyz32f", 400, motion=True),
+            ]))
+        return sensors
 
     def get_depth_scale(self):
         return 0.001
 
 
 class FakeSensor:
-    """rs.sensor: supports / set_option (records what was set)."""
+    """rs.sensor: supports / set_option (records what was set) / get_info /
+    get_stream_profiles / get_option (stereo baseline, mm) / get_depth_scale."""
 
-    def __init__(self, rs_ns):
+    def __init__(self, rs_ns, name="Stereo Module", profiles=()):
         self.rs_ns = rs_ns
+        self.name = name
+        self.profiles = list(profiles)
 
     def supports(self, option):
+        if option.name == "stereo_baseline":
+            return self.rs_ns.baseline_option_supported and self.name == "Stereo Module"
         return True
 
     def set_option(self, option, value):
         self.rs_ns.options_set.append((option.name, value))
+
+    def get_option(self, option):
+        if option.name == "stereo_baseline":
+            return 50.0  # millimetres, as librealsense reports it
+        raise RuntimeError(f"option {option.name} not readable")
+
+    def get_info(self, member):
+        assert member.name == "name"
+        return self.name
+
+    def get_stream_profiles(self):
+        self.rs_ns.profile_queries += 1
+        return list(self.profiles)
+
+    def get_depth_scale(self):
+        return 0.001
+
+
+# Where each stream's origin sits in the depth frame (metres) and how the
+# IMU frame is rotated against the imagers, column-major as librealsense
+# stores it. Fake numbers, but asymmetric enough to catch a transposition.
+_STREAM_POSITIONS = {
+    "depth": (0.0, 0.0, 0.0), "infrared_1": (0.0, 0.0, 0.0), "infrared_2": (-0.05, 0.0, 0.0),
+    "color": (0.015, 0.0, 0.0), "accel": (-0.005, 0.005, 0.012), "gyro": (-0.005, 0.005, 0.012),
+}
+_IDENTITY_COL_MAJOR = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+_IMU_ROT_COL_MAJOR = [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+
+class FakeMotionIntrinsics:
+    """rs.motion_device_intrinsic: data (3x4) / noise_variances / bias_variances."""
+
+    data = [[1.0, 0.01, 0.0, 0.1], [0.0, 1.0, 0.0, 0.2], [0.0, 0.0, 1.0, 0.3]]
+    noise_variances = [1e-4, 1e-4, 1e-4]
+    bias_variances = [1e-6, 1e-6, 1e-6]
+
+
+class FakeStreamProfile:
+    """rs.stream_profile as returned by sensor.get_stream_profiles(): video or motion."""
+
+    def __init__(self, rs_ns, stream, index, fmt, fps, w=None, h=None, motion=False):
+        self.rs_ns, self._stream, self._index = rs_ns, stream, index
+        self._fmt, self._fps, self._w, self._h, self._motion = fmt, fps, w, h, motion
+
+    @property
+    def key(self):
+        return f"{self._stream}_{self._index}" if self._index else self._stream
+
+    def stream_type(self):
+        return _Enum(self._stream)
+
+    def stream_index(self):
+        return self._index
+
+    def format(self):
+        return _Enum(self._fmt)
+
+    def fps(self):
+        return self._fps
+
+    def is_video_stream_profile(self):
+        return not self._motion
+
+    def is_motion_stream_profile(self):
+        return self._motion
+
+    def as_video_stream_profile(self):
+        assert not self._motion
+        return self
+
+    def as_motion_stream_profile(self):
+        assert self._motion
+        return self
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h
+
+    def get_intrinsics(self):
+        if self.rs_ns.intrinsics_error_for == self.key:
+            raise RuntimeError("calibration table entry missing")
+        return FakeIntrinsics(self._w, self._h)
+
+    def get_motion_intrinsics(self):
+        if self.rs_ns.motion_intrinsics_error:
+            raise RuntimeError(self.rs_ns.motion_intrinsics_error)
+        return FakeMotionIntrinsics()
+
+    def get_extrinsics_to(self, other):
+        # p_to = R * p_from + t: the 'from' origin lands at t in the 'to' frame.
+        mine, theirs = _STREAM_POSITIONS[self.key], _STREAM_POSITIONS[other.key]
+        imu = {"accel", "gyro"}
+        rotation = (_IMU_ROT_COL_MAJOR if (self.key in imu) != (other.key in imu)
+                    else _IDENTITY_COL_MAJOR)
+        return SimpleNamespace(rotation=list(rotation),
+                               translation=[round(a - b, 6) for a, b in zip(mine, theirs)])
 
 
 class FakeIntrinsics:
@@ -228,6 +366,8 @@ class FakeContext:
     def query_devices(self):
         if self.rs.enumeration_error:
             raise RuntimeError(self.rs.enumeration_error)
+        for dev in self.rs.devices:
+            dev.rs_ns = self.rs
         return list(self.rs.devices)
 
 
@@ -246,6 +386,7 @@ class FakeRS:
 
     class option:
         auto_exposure_priority = _Enum("auto_exposure_priority")
+        stereo_baseline = _Enum("stereo_baseline")
 
     class camera_info:
         name = _Enum("name")
@@ -268,6 +409,12 @@ class FakeRS:
         self.frame_interval_s = 0.002
         self.started_pipelines = []
         self.last_config = None
+        # Calibration read: counts profile walks; failure injection per entry.
+        self.profile_queries = 0
+        self.baseline_option_supported = True
+        self.intrinsics_error_for = None    # a stream key whose intrinsics raise
+        self.motion_intrinsics_error = None
+        self.sensor_query_error = None
 
     def context(self):
         return FakeContext(self)
@@ -1050,3 +1197,141 @@ def test_diagnostic_start_never_resets_stuck_camera(rs, monkeypatch):
         cam.start(preserve_sensor_settings=True)
     assert rs.options_set == [] and rs.resets == 0
     assert all(p.stopped for p in rs.started_pipelines)
+
+
+# ---------------------------------------------------------------------------
+# Stored device calibration
+# ---------------------------------------------------------------------------
+
+_IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+class TestCalibration:
+    def test_reads_without_starting_the_pipeline(self, rs, camera):
+        cal = camera.calibration()
+        assert rs.started_pipelines == [] and not camera.streaming
+        assert cal["camera_id"] == "rs435i" and cal["device"]["serial"] == "123456"
+        assert [s["name"] for s in cal["sensors"]] == ["Stereo Module", "RGB Camera", "Motion Module"]
+        assert cal["sensors"][0]["streams"] == ["depth", "infrared_1", "infrared_2"]
+        assert list(cal["streams"]) == ["depth", "infrared_1", "infrared_2", "color"]
+        assert cal["read_at"].endswith("+00:00")
+
+    def test_infrared_intrinsics_per_resolution(self, camera):
+        ir2 = camera.calibration()["streams"]["infrared_2"]
+        assert ir2["sensor"] == "Stereo Module"
+        assert [(r["width"], r["height"]) for r in ir2["resolutions"]] == [(848, 480), (1280, 720)]
+        hd = ir2["resolutions"][1]
+        assert hd["formats"] == {"y8": [15, 30]}
+        assert hd["intrinsics"]["stream"] == "infrared_2"
+        assert (hd["intrinsics"]["ppx"], hd["intrinsics"]["ppy"]) == (640.0, 360.0)
+        assert hd["intrinsics"]["model"] == "brown_conrady"
+
+    def test_formats_sharing_intrinsics_are_grouped(self, camera):
+        color = camera.calibration()["streams"]["color"]
+        assert color["sensor"] == "RGB Camera"
+        assert [(r["width"], r["height"]) for r in color["resolutions"]] == [(640, 480), (1280, 720)]
+        assert color["resolutions"][1]["formats"] == {"bgr8": [15, 30], "rgb8": [15, 30]}
+        assert color["resolutions"][0]["formats"] == {"bgr8": [30]}
+
+    def test_extrinsics_between_every_pair(self, camera):
+        ext = camera.calibration()["extrinsics"]
+        assert list(ext) == ["depth", "infrared_1", "infrared_2", "color", "accel", "gyro"]
+        assert "depth" not in ext["depth"] and len(ext["depth"]) == 5
+        assert ext["depth"]["color"]["translation_m"] == [-0.015, 0.0, 0.0]
+        assert ext["depth"]["color"]["rotation_matrix"] == _IDENTITY
+        assert ext["infrared_1"]["infrared_2"]["translation_m"] == [0.05, 0.0, 0.0]
+        assert ext["infrared_2"]["color"]["translation_m"] == [-0.065, 0.0, 0.0]
+        assert ext["depth"]["infrared_1"]["translation_m"] == [0.0, 0.0, 0.0]
+
+    def test_rotation_matrix_is_transposed_from_column_major(self, camera):
+        ext = camera.calibration()["extrinsics"]["accel"]["depth"]
+        assert ext["rotation_column_major"] == _IMU_ROT_COL_MAJOR
+        assert ext["rotation_matrix"] == [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        assert ext["translation_m"] == [-0.005, 0.005, 0.012]
+
+    def test_stereo_baseline_from_the_option(self, camera):
+        base = camera.calibration()["stereo_baseline"]
+        assert base == {"baseline_m": 0.05, "source": "option.stereo_baseline",
+                        "infrared_1_to_infrared_2_m": 0.05}
+
+    def test_stereo_baseline_falls_back_to_extrinsics(self, rs, camera):
+        rs.baseline_option_supported = False
+        base = camera.calibration()["stereo_baseline"]
+        assert base["source"] == "extrinsics.infrared_1.infrared_2"
+        assert base["baseline_m"] == 0.05
+
+    def test_imu_intrinsics_and_extrinsics_on_a_d435i(self, camera):
+        cal = camera.calibration()
+        imu = cal["imu"]
+        assert imu["present"] and list(imu["streams"]) == ["accel", "gyro"]
+        accel, gyro = imu["streams"]["accel"], imu["streams"]["gyro"]
+        assert accel["sensor"] == "Motion Module" and accel["units"] == "m/s^2"
+        assert accel["formats"] == {"motion_xyz32f": [63, 250]}
+        assert gyro["units"] == "rad/s" and gyro["formats"] == {"motion_xyz32f": [200, 400]}
+        intr = accel["intrinsics"]
+        assert intr["data"] == FakeMotionIntrinsics.data
+        assert intr["scale_and_cross_axis"] == [[1.0, 0.01, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        assert intr["bias"] == [0.1, 0.2, 0.3]
+        assert intr["noise_variances"] == [1e-4] * 3 and intr["bias_variances"] == [1e-6] * 3
+        # IMU-camera and accel-gyro extrinsics ride along in the pair table.
+        assert cal["extrinsics"]["accel"]["gyro"]["translation_m"] == [0.0, 0.0, 0.0]
+        assert cal["extrinsics"]["accel"]["gyro"]["rotation_matrix"] == _IDENTITY
+        assert cal["extrinsics"]["gyro"]["color"]["translation_m"] == [-0.02, 0.005, 0.012]
+
+    def test_d405_has_no_imu(self, rs):
+        rs.devices = [FakeDevice("405", name="Intel RealSense D405")]
+        cal = RealSenseCamera(_config(), rs_module=rs, np_module=np).calibration()
+        assert cal["imu"] == {"present": False, "streams": {}}
+        assert [s["name"] for s in cal["sensors"]] == ["Stereo Module", "RGB Camera"]
+        assert list(cal["extrinsics"]) == ["depth", "infrared_1", "infrared_2", "color"]
+        assert cal["stereo_baseline"]["baseline_m"] == 0.05
+
+    def test_cached_per_serial_and_refreshable(self, rs, camera):
+        first = camera.calibration()
+        walks = rs.profile_queries
+        assert walks > 0
+        assert camera.calibration() is first and rs.profile_queries == walks
+        assert camera.calibration(refresh=True) is not first and rs.profile_queries > walks
+        rs.devices = [FakeDevice("654321")]        # another camera plugged in
+        walks = rs.profile_queries
+        assert camera.calibration()["device"]["serial"] == "654321" and rs.profile_queries > walks
+
+    def test_unreadable_intrinsics_are_reported_not_raised(self, rs, camera):
+        rs.intrinsics_error_for = "infrared_2"
+        cal = camera.calibration()
+        for res in cal["streams"]["infrared_2"]["resolutions"]:
+            assert res["intrinsics"] == {"error": "RuntimeError: calibration table entry missing"}
+        assert "error" not in cal["streams"]["infrared_1"]["resolutions"][0]["intrinsics"]
+
+    def test_unreadable_motion_intrinsics_are_reported(self, rs, camera):
+        rs.motion_intrinsics_error = "motion intrinsics not calibrated"
+        imu = camera.calibration()["imu"]
+        assert imu["streams"]["accel"]["intrinsics"] == {"error": "RuntimeError: motion intrinsics not calibrated"}
+        assert imu["streams"]["accel"]["formats"] == {"motion_xyz32f": [63, 250]}
+
+    def test_works_while_streaming(self, rs, camera):
+        camera.start()
+        _wait_frames(camera)
+        cal = camera.calibration()
+        assert camera.streaming and cal["stereo_baseline"]["baseline_m"] == 0.05
+        assert len(rs.started_pipelines) == 1
+
+    def test_sdk_failure_is_a_realsense_error(self, rs, camera):
+        rs.sensor_query_error = "USB transfer failed"
+        with pytest.raises(RealSenseError, match="USB transfer failed"):
+            camera.calibration()
+
+    def test_no_device_or_disabled_is_unavailable(self, rs):
+        rs.devices = []
+        with pytest.raises(RealSenseUnavailable, match="no RealSense device"):
+            RealSenseCamera(_config(), rs_module=rs, np_module=np).calibration()
+        with pytest.raises(RealSenseUnavailable, match="disabled"):
+            RealSenseCamera(_config(enabled=False), rs_module=rs, np_module=np).calibration()
+
+    def test_flat_motion_data_is_reshaped(self):
+        mi = SimpleNamespace(data=list(range(12)), noise_variances=[1, 2, 3], bias_variances=[4, 5, 6])
+        d = rc._motion_intrinsics_dict(mi)
+        assert d["data"][1] == [4.0, 5.0, 6.0, 7.0] and d["bias"] == [3.0, 7.0, 11.0]
+        with pytest.raises(ValueError, match="expected 3x4"):
+            rc._motion_intrinsics_dict(SimpleNamespace(data=[1.0, 2.0], noise_variances=[], bias_variances=[]))
+

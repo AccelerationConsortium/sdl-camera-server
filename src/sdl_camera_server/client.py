@@ -28,6 +28,13 @@ class CameraClient:
     def depth_png(self, camera_id):
         return self.request('GET', f'/v1/cameras/{camera_id}/depth.png').content
 
+    def intrinsics(self, camera_id):
+        return self.request('GET', f'/v1/cameras/{camera_id}/intrinsics').json()
+
+    def calibration(self, camera_id, refresh=False):
+        return self.request('GET', f'/v1/cameras/{camera_id}/calibration',
+                            params={'refresh': 'true' if refresh else 'false'}).json()
+
     def capture(self, camera_id, **metadata):
         return self.request('POST', f'/v1/cameras/{camera_id}/captures', json=metadata).json()
 

@@ -15,6 +15,12 @@ librealsense pipeline and hands the API server ready-to-serve artefacts:
 * :meth:`RealSenseCamera.depth_at` -- metric distance (and a camera-frame 3-D
   point) for one pixel, the primitive a "did the arm really get there"
   vision check or a plate-locator builds on.
+* :meth:`RealSenseCamera.calibration` -- the calibration stored on the
+  device: intrinsics of every supported video profile (depth, colour, left
+  and right infrared), the extrinsics between every pair of streams, the
+  stereo baseline and, on a D435i, the accelerometer / gyroscope intrinsics
+  and their extrinsics. Read from the calibration table, so it needs no
+  running pipeline.
 
 Design constraints, shared with the other optional subsystems:
 
@@ -175,6 +181,9 @@ class RealSenseCamera:
         self._device_info: Optional[Dict[str, Any]] = None
         self._depth_scale: Optional[float] = None
         self._intrinsics: Dict[str, Dict[str, Any]] = {}
+        # Stored device calibration (see :meth:`calibration`): read once per
+        # device, keyed by serial, refreshed only on request.
+        self._calibration: Optional[Dict[str, Any]] = None
         self._frames_captured = 0
         self._fps_ema: Optional[float] = None
         self._last_consumer_at = time.monotonic()
@@ -800,6 +809,57 @@ class RealSenseCamera:
                 "streams": dict(self._intrinsics),
             }
 
+    def calibration(self, *, refresh: bool = False) -> Dict[str, Any]:
+        """The calibration stored on the device, for every stream it offers.
+
+        Unlike :meth:`intrinsics`, which describes the two streams the
+        pipeline is running, this walks every sensor's stream profiles
+        through ``device.query_sensors()`` and reads the factory / stored
+        calibration table: intrinsics per video stream and resolution
+        (depth, colour, ``infrared_1`` / ``infrared_2``), the extrinsics
+        between every pair of streams, the stereo baseline, and on a camera
+        with a motion module (D435i) the accelerometer and gyroscope
+        intrinsics plus their extrinsics to the imagers. Nothing is streamed
+        and nothing on the device changes, so it works while the pipeline is
+        off and while it is running.
+
+        The table is fixed per device, so the result is cached by serial;
+        ``refresh=True`` re-reads it (after ``rs-imu-calibration`` or a
+        firmware update). A stream whose entry cannot be read is reported
+        with an ``error`` field rather than failing the whole read; a missing
+        backend or camera raises :class:`RealSenseUnavailable`.
+        """
+        if not self.enabled:
+            raise RealSenseUnavailable("RealSense camera disabled (enabled: false in realsense.yaml)")
+        if not self.installed:
+            raise RealSenseUnavailable(
+                f"pyrealsense2 not installed ({self.install_error}); run `uv sync --extra realsense`"
+            )
+        info = self._pick_device()
+        serial = info.get("serial")
+        with self._lock:
+            cached = self._calibration
+        if cached is not None and not refresh and cached["device"].get("serial") == serial:
+            return cached
+        dev = self._rs_device(serial)
+        try:
+            result = read_device_calibration(dev, self._rs, device=self._device_dict(dev))
+        except RealSenseError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - librealsense raises plain RuntimeError
+            raise RealSenseError(f"could not read the device calibration: {exc}") from exc
+        result["camera_id"] = self.camera_id
+        with self._lock:
+            self._calibration = result
+        return result
+
+    def _rs_device(self, serial: Optional[str]) -> Any:
+        """The live ``rs.device`` handle for ``serial`` (or the only camera)."""
+        for dev in self._rs.context().query_devices():
+            if serial is None or self._device_dict(dev).get("serial") == serial:
+                return dev
+        raise RealSenseUnavailable(f"RealSense serial {serial!r} disappeared during calibration read")
+
     def describe(self) -> Dict[str, Any]:
         """Everything the panel / ``GET /realsense/<id>/status`` needs. Never raises."""
         devices = self.list_devices()
@@ -1120,6 +1180,173 @@ def _intrinsics_dict(intr: Any, stream: str) -> Dict[str, Any]:
         "ppy": float(getattr(intr, "ppy", 0.0)),
         "model": str(model).split(".")[-1] if model is not None else None,
         "coeffs": [float(c) for c in (getattr(intr, "coeffs", None) or [])],
+    }
+
+
+# Streams in the order a reader expects them; anything else the device
+# offers (a future confidence or fisheye stream) is appended alphabetically.
+_CALIBRATION_STREAM_ORDER = ("depth", "infrared_1", "infrared_2", "color", "accel", "gyro")
+_MOTION_UNITS = {"accel": "m/s^2", "gyro": "rad/s"}
+
+
+def read_device_calibration(dev: Any, rs: Any, *, device: Dict[str, Any]) -> Dict[str, Any]:
+    """Walk ``dev``'s sensors and stream profiles; return the stored calibration.
+
+    Pure read: no pipeline, no option writes. Each per-stream entry that the
+    SDK refuses is reported as ``{"error": ...}`` so one unreadable profile
+    never hides the rest.
+    """
+    from datetime import datetime, timezone
+
+    sensors: List[Dict[str, Any]] = []
+    video: Dict[str, Dict[str, Any]] = {}
+    motion: Dict[str, Dict[str, Any]] = {}
+    reference: Dict[str, Any] = {}   # one profile per stream key, for extrinsics
+    for sensor in dev.query_sensors():
+        sensor_name = _call_or_arg(sensor, "get_info", rs.camera_info.name, None)
+        keys: List[str] = []
+        for profile in sensor.get_stream_profiles():
+            key = _stream_key(profile)
+            reference.setdefault(key, profile)
+            if key not in keys:
+                keys.append(key)
+            fmt = _enum_name(_call_or(profile, "format", None))
+            fps = int(_call_or(profile, "fps", 0) or 0)
+            if _call_or(profile, "is_video_stream_profile", False):
+                vsp = profile.as_video_stream_profile()
+                try:
+                    intr = _intrinsics_dict(vsp.get_intrinsics(), key)
+                except Exception as exc:  # noqa: BLE001
+                    intr = {"error": f"{type(exc).__name__}: {exc}"}
+                width, height = int(vsp.width()), int(vsp.height())
+                entry = video.setdefault(key, {"sensor": sensor_name, "resolutions": []})
+                for res in entry["resolutions"]:
+                    if (res["width"], res["height"], res["intrinsics"]) == (width, height, intr):
+                        res["formats"].setdefault(fmt, []).append(fps)
+                        break
+                else:
+                    entry["resolutions"].append({"width": width, "height": height,
+                                                 "formats": {fmt: [fps]}, "intrinsics": intr})
+            elif _call_or(profile, "is_motion_stream_profile", False):
+                entry = motion.setdefault(key, {"sensor": sensor_name, "units": _MOTION_UNITS.get(key),
+                                                "formats": {}, "intrinsics": None})
+                entry["formats"].setdefault(fmt, []).append(fps)
+                if entry["intrinsics"] is None:
+                    try:
+                        entry["intrinsics"] = _motion_intrinsics_dict(
+                            profile.as_motion_stream_profile().get_motion_intrinsics())
+                    except Exception as exc:  # noqa: BLE001
+                        entry["intrinsics"] = {"error": f"{type(exc).__name__}: {exc}"}
+        sensors.append({"name": sensor_name, "streams": keys})
+
+    for entry in video.values():
+        entry["resolutions"].sort(key=lambda r: (r["width"], r["height"]))
+        for res in entry["resolutions"]:
+            res["formats"] = {f: sorted(set(v)) for f, v in res["formats"].items()}
+    for entry in motion.values():
+        entry["formats"] = {f: sorted(set(v)) for f, v in entry["formats"].items()}
+
+    order = [k for k in _CALIBRATION_STREAM_ORDER if k in reference]
+    order += sorted(k for k in reference if k not in _CALIBRATION_STREAM_ORDER)
+    extrinsics: Dict[str, Dict[str, Any]] = {}
+    for src in order:
+        extrinsics[src] = {}
+        for dst in order:
+            if src == dst:
+                continue
+            try:
+                extrinsics[src][dst] = _extrinsics_dict(reference[src].get_extrinsics_to(reference[dst]))
+            except Exception as exc:  # noqa: BLE001
+                extrinsics[src][dst] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    baseline: Dict[str, Any] = {"baseline_m": None, "source": None, "infrared_1_to_infrared_2_m": None}
+    option = getattr(getattr(rs, "option", None), "stereo_baseline", None)
+    if option is not None:
+        try:
+            depth_sensor = dev.first_depth_sensor()
+            if depth_sensor.supports(option):
+                # librealsense reports RS2_OPTION_STEREO_BASELINE in millimetres.
+                baseline["baseline_m"] = float(depth_sensor.get_option(option)) / 1000.0
+                baseline["source"] = "option.stereo_baseline"
+        except Exception as exc:  # noqa: BLE001
+            baseline["error"] = f"{type(exc).__name__}: {exc}"
+    translation = extrinsics.get("infrared_1", {}).get("infrared_2", {}).get("translation_m")
+    if translation:
+        baseline["infrared_1_to_infrared_2_m"] = float(sum(t * t for t in translation) ** 0.5)
+    if baseline["baseline_m"] is None and baseline["infrared_1_to_infrared_2_m"] is not None:
+        baseline["baseline_m"] = baseline["infrared_1_to_infrared_2_m"]
+        baseline["source"] = "extrinsics.infrared_1.infrared_2"
+
+    return {
+        "read_at": datetime.now(timezone.utc).isoformat(),
+        "device": dict(device),
+        "sensors": sensors,
+        "streams": {k: video[k] for k in order if k in video},
+        "extrinsics": extrinsics,
+        "stereo_baseline": baseline,
+        "imu": {
+            "present": bool(motion),
+            "streams": {k: motion[k] for k in order if k in motion},
+        },
+        "conventions": {
+            "axes": "camera frames: +X right, +Y down, +Z out of the lens; metres",
+            "extrinsics": ("extrinsics[from][to] maps a point from the 'from' stream's frame "
+                           "into the 'to' frame: p_to = R * p_from + t. rotation_matrix is R "
+                           "row-major (3x3); rotation_column_major is librealsense's own order."),
+            "intrinsics": "pinhole (fx, fy, ppx, ppy) in pixels of that resolution; coeffs follow model",
+            "imu_intrinsics": ("measured = scale_and_cross_axis * true + bias, in the stream's units; "
+                               "noise_variances / bias_variances are per axis in those units squared. "
+                               "An uncalibrated module reports identity scale and zero bias."),
+            "stereo_baseline": "distance between the left and right imagers, metres",
+        },
+    }
+
+
+def _enum_name(member: Any) -> Optional[str]:
+    if member is None:
+        return None
+    name = getattr(member, "name", None)
+    return str(name) if name else str(member).split(".")[-1]
+
+
+def _call_or_arg(obj: Any, method: str, arg: Any, default: Any) -> Any:
+    try:
+        return getattr(obj, method)(arg)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _stream_key(profile: Any) -> str:
+    """``depth`` / ``color`` / ``infrared_1`` / ``infrared_2`` / ``accel`` / ``gyro``."""
+    name = _enum_name(_call_or(profile, "stream_type", None)) or "unknown"
+    index = int(_call_or(profile, "stream_index", 0) or 0)
+    return f"{name}_{index}" if index > 0 else name
+
+
+def _extrinsics_dict(ext: Any) -> Dict[str, Any]:
+    rotation = [float(v) for v in ext.rotation]          # column-major, as librealsense stores it
+    matrix = [[rotation[col * 3 + row] for col in range(3)] for row in range(3)]
+    return {
+        "rotation_matrix": matrix,
+        "rotation_column_major": rotation,
+        "translation_m": [float(v) for v in ext.translation],
+    }
+
+
+def _motion_intrinsics_dict(mi: Any) -> Dict[str, Any]:
+    raw = getattr(mi, "data", None)
+    raw = list(raw) if raw is not None else []       # pybind hands back 3 rows of 4
+    flat = ([float(v) for row in raw for v in row] if raw and hasattr(raw[0], "__iter__")
+            else [float(v) for v in raw])
+    if len(flat) != 12:
+        raise ValueError(f"motion intrinsics data has {len(flat)} values, expected 3x4")
+    rows = [flat[i * 4:(i + 1) * 4] for i in range(3)]
+    return {
+        "data": rows,
+        "scale_and_cross_axis": [row[:3] for row in rows],
+        "bias": [row[3] for row in rows],
+        "noise_variances": [float(v) for v in getattr(mi, "noise_variances", None) or []],
+        "bias_variances": [float(v) for v in getattr(mi, "bias_variances", None) or []],
     }
 
 

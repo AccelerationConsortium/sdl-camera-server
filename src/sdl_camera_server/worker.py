@@ -67,6 +67,10 @@ def _run(pipe, spec):
                     if kind != 'realsense':
                         raise CameraError('This camera has no depth calibration', 409)
                     result = camera.intrinsics()
+                elif operation == 'calibration':
+                    if kind != 'realsense':
+                        raise CameraError('This camera has no stored calibration', 409)
+                    result = camera.calibration(refresh=bool(args.get('refresh')))
                 elif operation == 'depth_at':
                     if kind != 'realsense':
                         raise CameraError('This camera has no depth stream', 409)

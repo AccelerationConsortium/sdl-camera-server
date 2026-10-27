@@ -31,7 +31,7 @@ def urls(camera_id):
     base = f'/v1/cameras/{camera_id}'
     return {key: base + '/' + value for key, value in dict(status='status', snapshot='snapshot.jpg',
             stream='stream.mjpg', depth_png='depth.png', depth='depth', intrinsics='intrinsics',
-            captures='captures', start='start', stop='stop').items()}
+            calibration='calibration', captures='captures', start='start', stop='stop').items()}
 
 
 def create_app(config, service=None):
@@ -115,10 +115,10 @@ def create_app(config, service=None):
                         'reason': exc.detail}
             caps = ['color', 'snapshot', 'mjpeg', 'captures']
             if w.spec['kind'] == 'realsense':
-                caps += ['depth', 'intrinsics', 'diagnostic']
+                caps += ['depth', 'intrinsics', 'calibration', 'diagnostic']
             item.update(id=camera_id, kind=w.spec['kind'], capabilities=caps, urls=urls(camera_id))
             if w.spec['kind'] == 'usb':
-                for key in ('depth','depth_png','intrinsics'):
+                for key in ('depth','depth_png','intrinsics','calibration'):
                     item['urls'].pop(key, None)
             out.append(item)
         return {'cameras': out, 'default': out[0]['id'] if len(out)==1 else None}
@@ -152,6 +152,13 @@ def create_app(config, service=None):
     @app.get('/v1/cameras/{camera_id}/intrinsics')
     async def intrinsics(camera_id: str, p=Depends(principal)):
         return await run(worker(camera_id,p).call, 'intrinsics')
+
+    @app.get('/v1/cameras/{camera_id}/calibration')
+    async def calibration(camera_id: str, refresh: bool = False, p=Depends(principal)):
+        """Stored device calibration: per-profile intrinsics (depth, color, infrared 1/2),
+        extrinsics between every stream pair, stereo baseline, and IMU intrinsics/extrinsics
+        on a D435i. Read from the device without streaming; cached until ``refresh=true``."""
+        return await run(worker(camera_id,p).call, 'calibration', refresh=refresh)
 
     @app.get('/v1/cameras/{camera_id}/depth')
     async def depth(camera_id: str, x: int, y: int, window: int = Query(5,ge=1,le=101), p=Depends(principal)):

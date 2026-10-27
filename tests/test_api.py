@@ -41,8 +41,10 @@ def test_auth_scope_and_capabilities(client):
     camera=client.get('/v1/cameras').json()['cameras'][0]
     assert 'depth' not in camera['capabilities']
     assert 'depth' not in camera['urls']
+    assert 'calibration' not in camera['capabilities'] and 'calibration' not in camera['urls']
     assert client.get('/v1/cameras/other/status').status_code==403
     assert client.get('/v1/cameras/overhead/depth.png').status_code==409
+    assert client.get('/v1/cameras/overhead/calibration').status_code==409
 
 def test_snapshot_and_capture_archive(client):
     client.headers['Authorization']='Bearer '+TOKEN
@@ -80,6 +82,31 @@ def test_mjpeg_has_frame_boundaries_and_skips_duplicate_frames(tmp_path):
     assert b'Content-Length: 5\r\nX-Frame-Number: 1\r\n' in response.content
     assert b'Content-Length: 6\r\nX-Frame-Number: 2\r\n' in response.content
     assert service.workers['overhead'].calls==4
+
+def test_realsense_calibration_route_forwards_refresh(tmp_path):
+    class RealSenseWorker(Worker):
+        spec={'kind':'realsense'}
+        def __init__(self):self.calls=[]
+        def call(self,op,**kwargs):
+            if op=='calibration':
+                self.calls.append(kwargs)
+                return {'device':{'serial':'123'},'stereo_baseline':{'baseline_m':0.05},'imu':{'present':True}}
+            return super().call(op,**kwargs)
+    service=Service()
+    service.workers={'depth':RealSenseWorker()}
+    config={'tokens':[{'token':TOKEN,'cameras':['depth'],'admin':False}],
+            '_lock_path':str(tmp_path/'test.lock')}
+    with TestClient(create_app(config,service)) as client:
+        client.headers['Authorization']='Bearer '+TOKEN
+        camera=client.get('/v1/cameras').json()['cameras'][0]
+        assert 'calibration' in camera['capabilities']
+        assert camera['urls']['calibration']=='/v1/cameras/depth/calibration'
+        r=client.get(camera['urls']['calibration'])
+        assert r.status_code==200 and r.json()['stereo_baseline']['baseline_m']==0.05
+        assert client.get('/v1/cameras/depth/calibration?refresh=true').status_code==200
+        assert client.get('/v1/cameras/depth/calibration?refresh=maybe').status_code==422
+    assert service.workers['depth'].calls==[{'refresh':False},{'refresh':True}]
+
 
 def test_duplicate_camera_owner_rejected():
     with pytest.raises(ValueError,match='same camera'):

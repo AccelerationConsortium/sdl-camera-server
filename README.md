@@ -85,6 +85,27 @@ and depth pair, use `POST /v1/cameras/{id}/captures` and fetch its two image
 artifacts. Only use corresponding pixel coordinates when `aligned_to` from
 `/intrinsics` is `color`.
 
+`/intrinsics` describes the two streams the pipeline is running. The
+calibration stored on the device is a separate, read-only request that needs no
+running pipeline and does not change the camera:
+
+```python
+cal = camera.calibration("<camera-id>")          # GET /v1/cameras/<camera-id>/calibration
+left = cal["streams"]["infrared_1"]["resolutions"]  # intrinsics per resolution, formats + fps
+depth_to_color = cal["extrinsics"]["depth"]["color"]  # rotation_matrix (3x3), translation_m
+baseline_m = cal["stereo_baseline"]["baseline_m"]
+if cal["imu"]["present"]:                        # D435i
+    accel = cal["imu"]["streams"]["accel"]["intrinsics"]  # scale_and_cross_axis, bias, *_variances
+    accel_to_depth = cal["extrinsics"]["accel"]["depth"]
+```
+
+`streams` covers every video stream the device offers (`depth`, `color`,
+`infrared_1`, `infrared_2`), `extrinsics[from][to]` every ordered pair of
+streams including the IMU ones, and `conventions` spells out the frame and
+matrix order. The result is cached per device serial; pass `refresh=true` after
+`rs-imu-calibration` or a firmware update. An entry the SDK cannot read carries
+an `error` field instead of failing the request.
+
 ## API
 
 `/health` and OpenAPI documentation are public. Every `/v1/*` route requires
@@ -100,6 +121,10 @@ identity and robot claim rules; service credentials are not end-user credentials
 - `GET /v1/cameras/{id}/snapshot.jpg?stream=color`: JPEG; starts on demand.
 - `GET /v1/cameras/{id}/stream.mjpg?fps=10`: MJPEG; 0.5–30 output fps.
 - RealSense: `GET .../depth.png`, `.../intrinsics`, `.../depth?x=100&y=100`.
+- RealSense: `GET .../calibration?refresh=false`: stored device calibration —
+  intrinsics of every supported video profile, extrinsics between all streams,
+  stereo baseline, and on a D435i the accelerometer/gyroscope intrinsics and
+  IMU–camera extrinsics. No pipeline start.
 - RealSense: `POST .../diagnostic?start_if_idle=true`: bounded raw diagnostic ZIP.
 - `POST .../captures`: persist a paired capture with label/tags/context.
 - `GET .../captures`, `.../captures/{capture_id}`: capture metadata.
