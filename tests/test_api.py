@@ -83,6 +83,23 @@ def test_mjpeg_has_frame_boundaries_and_skips_duplicate_frames(tmp_path):
     assert b'Content-Length: 6\r\nX-Frame-Number: 2\r\n' in response.content
     assert service.workers['overhead'].calls==4
 
+def test_listing_reason_is_a_string_when_status_fails(tmp_path):
+    class BrokenWorker(Worker):
+        spec={'kind':'realsense'}
+        def call(self,op,**kwargs):
+            if op=='status':raise CameraError('Camera driver timed out; worker stopped')
+            return super().call(op,**kwargs)
+    service=Service()
+    service.workers={'depth':BrokenWorker()}
+    config={'tokens':[{'token':TOKEN,'cameras':['depth'],'admin':False}],
+            '_lock_path':str(tmp_path/'test.lock')}
+    with TestClient(create_app(config,service)) as client:
+        client.headers['Authorization']='Bearer '+TOKEN
+        camera=client.get('/v1/cameras').json()['cameras'][0]
+    assert camera['state']=='unavailable' and camera['present'] is False
+    assert camera['reason']=='Camera driver timed out; worker stopped'
+
+
 def test_realsense_calibration_route_forwards_refresh(tmp_path):
     class RealSenseWorker(Worker):
         spec={'kind':'realsense'}

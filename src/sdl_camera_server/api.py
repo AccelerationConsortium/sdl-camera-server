@@ -110,9 +110,15 @@ def create_app(config, service=None):
             try:
                 item = await run(w.call, 'status')
             except HTTPException as exc:
+                # ``reason`` is a string on every camera entry: a robot gateway
+                # copies it into its own status message, and a dict there broke
+                # the UR5e's /status with a validation error (2026-10-27).
+                detail = exc.detail
+                reason = (detail.get('reason') or detail.get('error') or str(detail)
+                          if isinstance(detail, dict) else str(detail))
                 item = {'id': camera_id, 'camera_id': camera_id, 'kind': w.spec['kind'],
                         'state': 'unavailable', 'present': False, 'streaming': False,
-                        'reason': exc.detail}
+                        'reason': reason}
             caps = ['color', 'snapshot', 'mjpeg', 'captures']
             if w.spec['kind'] == 'realsense':
                 caps += ['depth', 'intrinsics', 'calibration', 'diagnostic']
